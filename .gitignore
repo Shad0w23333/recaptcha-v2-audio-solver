@@ -17,6 +17,7 @@ build/
 *.mp3
 models/
 driver/__pycache__/
+.chrome_profile/
 
 # IDE
 .vscode/

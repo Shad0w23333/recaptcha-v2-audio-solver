@@ -1,4 +1,2 @@
-undetected-chromedriver
 selenium
-requests
 faster-whisper
