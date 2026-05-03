@@ -1,9 +1,11 @@
 import base64
+import io
 import os
+import threading
 import time
-import random
 import traceback
 from faster_whisper import WhisperModel
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -177,6 +179,29 @@ class AudioCaptchaSolver:
         if self.model is None:
             self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8", download_root=self.download_root)
 
+    def _start_model_preload(self):
+        # 后台预加载 Whisper 模型,与 Chrome / reCAPTCHA 流程并行进行,
+        # 等真正调用 transcribe 时模型已经 ready,省 ~1-2 秒。
+        # 已经加载过则 _load_model 内部直接返回。
+        threading.Thread(target=self._load_model, daemon=True).start()
+
+    # ---------- 等待 helper(替代 time.sleep) ----------
+
+    def _poll(self, predicate, timeout=5.0, interval=0.05):
+        # 轮询 predicate(driver) 直到返回 truthy 或超时。
+        # 比 time.sleep(N) 快几倍 —— sleep 是固定等 N 秒,
+        # 这个一旦条件满足就立即返回,典型场景下 < 0.5 秒。
+        # interval 0.05s ≈ 20Hz,响应延迟可忽略。
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if predicate(self.driver):
+                    return True
+            except Exception:
+                pass
+            time.sleep(interval)
+        return False
+
     # ---------- 浏览器浮动面板 helpers ----------
 
     def _setup_panel(self):
@@ -225,6 +250,8 @@ class AudioCaptchaSolver:
     def solve(self):
         self._setup_panel()
         self._set_attempt("启动")
+        # 后台预加载 Whisper 模型,与下面的 reCAPTCHA 流程并行
+        self._start_model_preload()
         try:
             print("[*] 寻找 reCAPTCHA 复选框 iframe...")
             self._panel("寻找 reCAPTCHA 复选框 iframe...", "progress")
@@ -241,7 +268,30 @@ class AudioCaptchaSolver:
             self.driver.switch_to.default_content()
             self._panel("已点击复选框,等待响应...", "progress")
 
-            time.sleep(2)
+            # 替代固定 sleep(2):等到 challenge iframe 变可见 (要弹音频挑战)
+            # 或 anchor 内 checkbox 变 checked (直接通过)。任一为真就立即继续。
+            def _checkbox_response_ready(d):
+                # 1) challenge iframe 变可见
+                for f in d.find_elements(By.XPATH, "//iframe[contains(@title, 'challenge')]"):
+                    try:
+                        if f.is_displayed():
+                            return True
+                    except Exception:
+                        pass
+                # 2) 直接通过 - checkbox-checked class 出现
+                try:
+                    d.switch_to.frame(checkbox_frame)
+                    ok = bool(d.find_elements(By.CLASS_NAME, "recaptcha-checkbox-checked"))
+                    d.switch_to.default_content()
+                    if ok:
+                        return True
+                except Exception:
+                    try:
+                        d.switch_to.default_content()
+                    except Exception:
+                        pass
+                return False
+            self._poll(_checkbox_response_ready, timeout=5.0)
 
         except Exception:
             print("[!] 未能定位/点击 reCAPTCHA 复选框")
@@ -276,21 +326,51 @@ class AudioCaptchaSolver:
             self.driver.switch_to.frame(challenge_frame)
 
             MAX_ATTEMPTS = 5
+            # multi correct / reload 后,reCAPTCHA 会自动准备下一段 audio。
+            # 此时再点 audio button 会被视为"重置当前段",反而让 audio src
+            # 不再变化(实测会陷入死循环反复识别同一段)。所以下一轮要 skip。
+            skip_audio_btn = False
             for attempt in range(MAX_ATTEMPTS):
                 print(f"[*] 第 {attempt + 1}/{MAX_ATTEMPTS} 次音频挑战")
                 self._set_attempt(f"第 {attempt + 1}/{MAX_ATTEMPTS} 次", restore_frame=challenge_frame)
                 self._panel(f"第 {attempt + 1}/{MAX_ATTEMPTS} 次音频挑战", "progress", restore_frame=challenge_frame)
 
-                try:
-                    audio_btn = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.ID, "recaptcha-audio-button"))
-                    )
-                    audio_btn.click()
-                except:
-                    if len(self.driver.find_elements(By.ID, "recaptcha-reload-button")) == 0:
+                # 先记录当前 audio-source.src(如果有的话),用于判断 reCAPTCHA
+                # 是否加载了新一段音频。第 1 轮通常没有,prev_src=""。
+                prev_src = ""
+                _sources = self.driver.find_elements(By.ID, "audio-source")
+                if _sources:
+                    try:
+                        prev_src = _sources[0].get_attribute("src") or ""
+                    except Exception:
                         pass
 
-                time.sleep(2)
+                if not skip_audio_btn:
+                    try:
+                        audio_btn = WebDriverWait(self.driver, 5).until(
+                            EC.element_to_be_clickable((By.ID, "recaptcha-audio-button"))
+                        )
+                        audio_btn.click()
+                    except:
+                        if len(self.driver.find_elements(By.ID, "recaptcha-reload-button")) == 0:
+                            pass
+                skip_audio_btn = False
+
+                # 替代固定 sleep(2):等 audio-source.src 真正"变成新 URL"
+                # (reCAPTCHA 加载完新一段音频,或第 1 轮首次出现) 或 'Try
+                # again later' 出现 (被风控)。
+                # !!! 不能只等 audio-source 元素出现 —— 该元素可能一直存在
+                # 但 src 还是上一轮的旧 URL,会导致反复识别同一段音频。
+                self._poll(
+                    lambda d, ps=prev_src: (
+                        any(
+                            (s.get_attribute("src") or "") and (s.get_attribute("src") or "") != ps
+                            for s in d.find_elements(By.ID, "audio-source")
+                        ) or
+                        bool(d.find_elements(By.XPATH, "//*[contains(text(), 'Try again later')]"))
+                    ),
+                    timeout=5.0,
+                )
 
                 if len(self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Try again later')]")) > 0:
                     print("[!] Google 提示 'Try again later' —— 当前 IP 被标记为可疑,无法继续。请更换网络/降低请求频率后再试。")
@@ -299,8 +379,10 @@ class AudioCaptchaSolver:
                     self._set_attempt("被风控")
                     return False
 
+                # audio-source 通常已经在上面的 _poll 中出现,这里 0 等待拿元素;
+                # 极少数情况下两个条件都没出现 (timeout),才走 except 走 break。
                 try:
-                    audio_source = WebDriverWait(self.driver, 5).until(
+                    audio_source = WebDriverWait(self.driver, 2).until(
                         EC.presence_of_element_located((By.ID, "audio-source"))
                     )
                     src_url = audio_source.get_attribute("src")
@@ -311,35 +393,37 @@ class AudioCaptchaSolver:
                     self._panel("未能找到音频源 (audio-source)", "warning")
                     break
 
-                mp3_path = f"captcha_{random.randint(1000,9999)}.mp3"
-                try:
-                    # 用浏览器内 fetch 下载 audio。绝不能用 Python requests:
-                    # Google 会通过 TLS 指纹/Cookies/Referer 判定为脚本抓取,
-                    # 直接把整个 reCAPTCHA session 拉黑(下次点 audio button
-                    # 就回 'Try again later'),即使浏览器其他特征都伪装好了。
-                    self.driver.set_script_timeout(30)
-                    fetch_result = self.driver.execute_async_script(_FETCH_AUDIO_JS, src_url)
-                    if not fetch_result or not fetch_result.get("ok"):
-                        err = (fetch_result or {}).get("error", "(unknown)")
-                        print(f"    └─ 浏览器内 fetch 音频失败: {err}")
-                        self._panel(f"fetch 音频失败: {err}", "error", restore_frame=challenge_frame)
-                        break
-                    audio_bytes = base64.b64decode(fetch_result["b64"])
-                    with open(mp3_path, 'wb') as f:
-                        f.write(audio_bytes)
-                    print(f"    ├─ 已下载 MP3: {mp3_path} ({len(audio_bytes)} 字节)")
-                    self._panel(f"已下载 MP3 ({len(audio_bytes)} 字节)", "info", restore_frame=challenge_frame)
+                # 安全网:如果新拿到的 src 与上一轮完全相同,说明 reCAPTCHA
+                # 已经不再切换音频 (常见于 multi correct 死循环 —— Whisper 转
+                # 错被反复要求"重输",但 reCAPTCHA 不给新音频)。立即 break,
+                # 避免空转 5 轮 timeout 浪费几十秒。
+                if attempt > 0 and prev_src and src_url == prev_src:
+                    print(f"    └─ src 与上一段相同,reCAPTCHA 不再切换音频,放弃")
+                    self._panel("音频未切换,放弃", "error", restore_frame=challenge_frame)
+                    break
 
-                    self._panel("Whisper 识别中...", "progress", restore_frame=challenge_frame)
-                    self._load_model()
+                # 用浏览器内 fetch 下载 audio。绝不能用 Python requests:
+                # Google 会通过 TLS 指纹/Cookies/Referer 判定为脚本抓取,
+                # 直接把整个 reCAPTCHA session 拉黑。
+                self.driver.set_script_timeout(30)
+                fetch_result = self.driver.execute_async_script(_FETCH_AUDIO_JS, src_url)
+                if not fetch_result or not fetch_result.get("ok"):
+                    err = (fetch_result or {}).get("error", "(unknown)")
+                    print(f"    └─ 浏览器内 fetch 音频失败: {err}")
+                    self._panel(f"fetch 音频失败: {err}", "error", restore_frame=challenge_frame)
+                    break
+                audio_bytes = base64.b64decode(fetch_result["b64"])
+                print(f"    ├─ 已获取 MP3 ({len(audio_bytes)} 字节)")
+                self._panel(f"已获取 MP3 ({len(audio_bytes)} 字节)", "info", restore_frame=challenge_frame)
 
-                    segments, info = self.model.transcribe(mp3_path, beam_size=5)
-                    text = " ".join([segment.text for segment in segments]).strip()
-                    print(f"    ├─ Whisper 转录结果: '{text}'")
-                    self._panel(f"Whisper 转录: \"{text}\"", "info", restore_frame=challenge_frame)
-                finally:
-                    if os.path.exists(mp3_path):
-                        os.remove(mp3_path)
+                self._panel("Whisper 识别中...", "progress", restore_frame=challenge_frame)
+                self._load_model()  # 已被 _start_model_preload 后台启动,这里通常立即返回
+
+                # 直接给 BytesIO,跳过写盘/读盘/删盘,faster-whisper 原生支持 BinaryIO
+                segments, info = self.model.transcribe(io.BytesIO(audio_bytes), beam_size=5)
+                text = " ".join([segment.text for segment in segments]).strip()
+                print(f"    ├─ Whisper 转录结果: '{text}'")
+                self._panel(f"Whisper 转录: \"{text}\"", "info", restore_frame=challenge_frame)
 
                 try:
                     input_box = self.driver.find_element(By.ID, "audio-response")
@@ -354,7 +438,19 @@ class AudioCaptchaSolver:
                 except:
                      pass
 
-                time.sleep(2)
+                # 替代固定 sleep(2):等结果。任一为真立即继续:
+                #   a) audio error 出现且有可见文本 (转错或需多段答案)
+                #   b) audio-source 元素从 DOM 消失 (验证通过,挑战即将关闭)
+                # timeout 1.5s 实测足够 —— 即使超时,后面有兜底:成功路径
+                # 会通过 checkbox-checked 判断;失败路径会通过 error 文本判断。
+                self._poll(
+                    lambda d: (
+                        any(e.is_displayed() and e.text.strip()
+                            for e in d.find_elements(By.CLASS_NAME, "rc-audiochallenge-error-message")) or
+                        not d.find_elements(By.ID, "audio-source")
+                    ),
+                    timeout=1.5,
+                )
 
                 error_msgs = self.driver.find_elements(By.CLASS_NAME, "rc-audiochallenge-error-message")
                 retry_needed = False
@@ -364,14 +460,17 @@ class AudioCaptchaSolver:
                         print(f"    └─ 提示需要多个正确答案,继续下一段音频")
                         self._panel("需要多个正确答案,继续下一段", "warning", restore_frame=challenge_frame)
                         retry_needed = True
-                        time.sleep(2)
+                        # multi correct 后 reCAPTCHA 会自动加载下一段,不要再点
+                        # audio_btn(否则陷入死循环)。下一轮开头 _poll 等 src 变化。
+                        skip_audio_btn = True
                     else:
                         print(f"    └─ 转录被判错 ('{err_text}'),刷新音频重试")
                         self._panel(f"转录被判错 ({err_text}),刷新重试", "warning", restore_frame=challenge_frame)
                         try:
                             reload_btn = self.driver.find_element(By.ID, "recaptcha-reload-button")
                             reload_btn.click()
-                            time.sleep(2)
+                            # reload 触发新音频自动加载,下一轮也跳过 audio_btn click
+                            skip_audio_btn = True
                         except:
                             pass
                         continue
@@ -392,9 +491,12 @@ class AudioCaptchaSolver:
                     except:
                         pass
 
+                    # 兜底:这里用极短 timeout(0.5s),因为成功路径上面已经 return 了,
+                    # 走到这里通常是 challenge iframe 已经消失 (验证通过) 或者
+                    # checkbox 状态还没及时同步。0.5s 足够给后者反应时间。
                     try:
                         self.driver.switch_to.default_content()
-                        challenge_frame = WebDriverWait(self.driver, 2).until(
+                        challenge_frame = WebDriverWait(self.driver, 0.5).until(
                              EC.presence_of_element_located((By.XPATH, "//iframe[contains(@title, 'challenge')]"))
                         )
                         self.driver.switch_to.frame(challenge_frame)

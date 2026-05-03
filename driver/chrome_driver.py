@@ -4,48 +4,51 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 
-def _detect_chrome_major_version():
-    # 探测本机 Google Chrome 的主版本号 (例如 Chrome 147.x.y.z 返回 147)。
-    # undetected-chromedriver 默认会去拉"最新"的 ChromeDriver,
-    # 一旦本机 Chrome 不是最新版本就会出现 "only supports Chrome version N" 报错。
-    # 这里显式探测后传给 uc.Chrome(version_main=...),保证版本对齐。
-    candidates = []
+# Chrome 远程调试端口。固定 9222 是为了让多次运行的 Python 进程都连同一个
+# Chrome 实例,避免反复 "启动 Chrome → 跑完 → 关 Chrome" 的开销。
+# 如果与你机器上其他服务冲突,可以改这个常量。
+REMOTE_DEBUG_PORT = 9222
+
+
+def _detect_chrome_binary():
+    # 找到本机 Chrome 的可执行路径。
     if sys.platform == "darwin":
-        # macOS 默认安装路径
-        candidates.append("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        for p in ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]:
+            if os.path.exists(p):
+                return p
     elif sys.platform.startswith("linux"):
-        # 常见 Linux 路径
-        candidates += ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium"]
+        for p in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium"]:
+            if os.path.exists(p):
+                return p
     elif sys.platform.startswith("win"):
-        # Windows 默认安装路径
         for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
             base = os.environ.get(env)
             if base:
-                candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
-
-    # 兜底:用 PATH 中的 google-chrome / chromium
+                p = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+                if os.path.exists(p):
+                    return p
     for name in ("google-chrome", "google-chrome-stable", "chromium", "chrome"):
         path = shutil.which(name)
         if path:
-            candidates.append(path)
-
-    for path in candidates:
-        if not path or not os.path.exists(path):
-            continue
-        try:
-            out = subprocess.check_output([path, "--version"], text=True, timeout=5)
-            # 输出示例: "Google Chrome 147.0.7727.138"
-            m = re.search(r"\b(\d+)\.", out)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            continue
+            return path
     return None
+
+
+def _is_chrome_alive_on_debug_port():
+    # 检测固定的 9222 端口上是否有 Chrome 在监听 DevTools Protocol。
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{REMOTE_DEBUG_PORT}/json/version")
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 # 在浏览器每个新文档加载时都会执行的"反指纹"JS。
@@ -72,7 +75,7 @@ Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 if (!window.chrome) { window.chrome = {}; }
 if (!window.chrome.runtime) { window.chrome.runtime = {}; }
 
-// 5. 阻止常见的 cdc_ 全局变量泄露(undetected-chromedriver 已经处理大部分,这里兜底)
+// 5. 阻止常见的 cdc_ 全局变量泄露
 for (var k in window) {
   if (k.indexOf('cdc_') === 0) {
     try { delete window[k]; } catch (e) {}
@@ -94,10 +97,8 @@ if (navigator.permissions && navigator.permissions.query) {
 
 
 def _sanitize_profile_state(profile_dir):
-    # selenium driver.quit() 在 Chrome 看来等同于"被 kill",会把 profile 的
-    # exit_type 标记为 'Crashed'。下次启动时 Chrome 会进入会话恢复流程,
-    # 恢复上次所有 tab,导致出现 3 个 window handle、demo 页面不是焦点、
-    # iframe 不可见,solver 找不到/点不到复选框。
+    # 复用 user-data-dir 时,如果上次 Chrome 异常退出,Chrome 会进入会话恢复
+    # 流程,恢复上次所有 tab,导致出现多 tab、demo 页面不是焦点等问题。
     # 这里在每次启动前:
     # 1) 把 exit_type / exited_cleanly 强制改回正常退出
     # 2) 删除 Sessions / Last Session / Last Tabs 等会话文件,让 Chrome
@@ -123,7 +124,6 @@ def _sanitize_profile_state(profile_dir):
         except Exception:
             pass
 
-    # 清理会话文件(Chrome 可恢复的 tab 列表)
     for name in ("Sessions", "Session Storage", "Last Session", "Last Tabs",
                  "Current Session", "Current Tabs"):
         target = os.path.join(default_dir, name)
@@ -139,11 +139,7 @@ def _sanitize_profile_state(profile_dir):
 
 
 def _close_extra_windows(driver):
-    # profile 复用时偶尔仍会出现多 tab (omnibox popup、内部 chrome:// 页面等),
-    # 而且 driver 当前 window 不一定是"真正的"普通 tab,直接 close-all-but-current
-    # 可能把唯一可用的 window 也关了。
-    # 这里的策略是:开一个全新的空白 tab → 关掉所有旧 tab → 切到新 tab。
-    # 这样无论旧 tab 是什么状态,最后剩下的一定是干净的 about:blank。
+    # profile 复用时可能出现多 tab。开一个全新空白 tab → 关掉所有旧 tab。
     try:
         old_handles = driver.window_handles
         if len(old_handles) <= 1:
@@ -166,8 +162,6 @@ def _close_extra_windows(driver):
 def _resolve_user_data_dir(custom_dir):
     # 持久化的 Chrome user profile 目录:让浏览器看起来"用过",
     # 累积 cookies / 历史 / Google 信任度,避免 reCAPTCHA 把每次都当成新机器人。
-    # 不要使用用户日常 Chrome 的 profile 目录(会冲突且可能泄露 cookies),
-    # 而是项目根目录下的 .chrome_profile/(已加入 .gitignore)。
     if custom_dir:
         path = os.path.abspath(custom_dir)
     else:
@@ -177,66 +171,98 @@ def _resolve_user_data_dir(custom_dir):
     return path
 
 
+def _launch_detached_chrome(profile_dir):
+    # 用 subprocess.Popen + start_new_session=True 启动 Chrome,
+    # 让 Chrome 进程脱离当前 Python 进程组,Python 退出后 Chrome 不会被清理,
+    # 这样下一次运行 Python 命令时可以直接 reconnect 到这个 Chrome,省启动时间。
+    chrome_bin = _detect_chrome_binary()
+    if not chrome_bin:
+        print("[!] 未找到 Chrome 可执行文件,无法启动")
+        return False
+
+    args = [
+        chrome_bin,
+        f"--remote-debugging-port={REMOTE_DEBUG_PORT}",
+        # window 大小由后续 driver.set_window_size 重新调整,这里给个初始值
+        "--window-size=1100,820",
+        # 强制英文(reCAPTCHA iframe title / 错误文本会跟系统语言走)
+        "--lang=en-US",
+        # 反检测核心
+        "--disable-blink-features=AutomationControlled",
+        # 禁掉所有非必要 UI
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble",
+        "--disable-features=ChromeWhatsNewUI,InfiniteSessionRestore",
+        # 启动加速
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-client-side-phishing-detection",
+        "--disable-domain-reliability",
+        "--metrics-recording-only",
+    ]
+    if profile_dir:
+        args.append(f"--user-data-dir={profile_dir}")
+
+    print(f"[i] 启动 detached Chrome (port {REMOTE_DEBUG_PORT}) ...")
+    subprocess.Popen(
+        args,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # 等 DevTools 端口起来 (最多 10 秒)
+    for _ in range(100):
+        if _is_chrome_alive_on_debug_port():
+            return True
+        time.sleep(0.1)
+    print(f"[!] Chrome 已启动但 {REMOTE_DEBUG_PORT} 端口在 10s 内仍未响应")
+    return False
+
+
 def create_driver(persistent_profile=True, user_data_dir=None):
-    """创建配置好反检测的 Chrome 实例。
+    """创建/复用 Chrome 实例。
+
+    工作流程:
+    1) 检查端口 9222 是否已经有 Chrome 在跑(上次运行留下的)
+       - 有:selenium 直接 connect,不重新启动 Chrome (~1s)
+       - 没有:subprocess detach 启动 Chrome,再 connect (~5s)
+    2) 应用 stealth JS / Network headers / 关多余 tab / 调整窗口
 
     参数:
-        persistent_profile: 是否使用持久化 user profile。默认 True,
-            让浏览器复用 cookies/history,显著降低被 reCAPTCHA 风控的概率。
-            设为 False 时每次都是全新 profile (容易触发 'Try again later')。
-        user_data_dir: 自定义 profile 目录。仅在 persistent_profile=True 时生效。
+        persistent_profile: 默认 True。使用 .chrome_profile/ 累积 Google 信任度。
+        user_data_dir: 自定义 profile 目录。
     """
-    options = Options()
-    # 不全屏 —— 给一个适中的窗口尺寸,既能完整显示 reCAPTCHA 与状态面板,
-    # 又不会霸占整个屏幕。
-    options.add_argument("--window-size=1100,820")
-
-    # 强制 Chrome 使用英文界面 —— 否则 reCAPTCHA 会根据系统语言(例如 zh-CN)
-    # 把 iframe 的 title、错误文案翻译成中文,导致 solver 中按英文文本写死的
-    # XPath/字符串匹配 ('challenge'、'Try again later'、'multiple correct')
-    # 全部失效。
-    options.add_argument("--lang=en-US")
-
-    # 反检测:阻止 Chrome 暴露 "受自动化控制" 的 navigator.webdriver 标志。
-    # 这是最有效的单个反检测参数。
-    options.add_argument("--disable-blink-features=AutomationControlled")
-
-    # 复用 user-data-dir 时,如果上次 Chrome 异常退出 (selenium driver.quit
-    # 可能让 Chrome 觉得自己"崩了"),下次启动会弹出 "会话恢复" 对话框,
-    # 导致 driver 找不到主窗口、后续操作全部失败。下面这组参数禁掉所有
-    # 非必要的首次运行 / 崩溃恢复 UI。
-    options.add_argument("--no-first-run")
-    options.add_argument("--no-default-browser-check")
-    options.add_argument("--disable-session-crashed-bubble")
-    options.add_argument("--hide-crash-restore-bubble")
-    options.add_argument("--disable-features=ChromeWhatsNewUI,InfiniteSessionRestore")
-
-    # 自动对齐本机 Chrome 主版本,避免 ChromeDriver/Chrome 版本不匹配的崩溃
-    version_main = _detect_chrome_major_version()
-
-    # 持久化 user-data-dir。这是降低风控概率的核心策略。
     profile_dir = _resolve_user_data_dir(user_data_dir) if persistent_profile else None
 
-    # 启动前修复 Crashed 标记,避免触发 Chrome 的会话恢复流程
-    if profile_dir:
-        _sanitize_profile_state(profile_dir)
+    # 如果 Chrome 已经活着 (上次运行留下的),直接复用。
+    # 否则在此会先 _sanitize_profile_state + _launch_detached_chrome。
+    if not _is_chrome_alive_on_debug_port():
+        if profile_dir:
+            _sanitize_profile_state(profile_dir)
+        if not _launch_detached_chrome(profile_dir):
+            raise RuntimeError(
+                f"无法启动 detached Chrome。请检查端口 {REMOTE_DEBUG_PORT} 是否被占用。"
+            )
 
-    chrome_kwargs = {"options": options}
-    if version_main:
-        chrome_kwargs["version_main"] = version_main
-    if profile_dir:
-        chrome_kwargs["user_data_dir"] = profile_dir
+    # selenium 通过 debuggerAddress 连接到现有 Chrome。
+    # 这种模式下 driver.quit() 只断开 chromedriver session,Chrome 进程保持。
+    options = Options()
+    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{REMOTE_DEBUG_PORT}")
+    driver = webdriver.Chrome(options=options)
 
-    driver = uc.Chrome(**chrome_kwargs)
-
-    # 关掉 Chrome 启动时遗留的多余窗口(omnibox popup、恢复的 tab 等),
-    # 确保 driver 操作的是单个干净的 tab。注意必须先做这一步,因为
-    # CDP 命令(Network/Page)是 per-target 的,新建 tab 后才在新 target
-    # 上执行,前面注入的 stealth JS 才会作用于真正使用的 tab。
+    # 关掉多余 tab,确保 driver 操作的是一个干净的 about:blank。
+    # 顺序很重要:先开干净 tab、关多余,然后注入 CDP,因为 CDP 是 per-target 的。
     _close_extra_windows(driver)
 
-    # 通过 CDP 再保险一次:覆盖 Accept-Language 请求头 + 注入 stealth JS。
-    # Network/Page domain 必须先 enable,否则相关命令会报错。
+    # CDP:Accept-Language header 强制英文 + stealth JS 注入
     try:
         driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd(
@@ -245,7 +271,6 @@ def create_driver(persistent_profile=True, user_data_dir=None):
         )
     except Exception:
         pass
-
     try:
         driver.execute_cdp_cmd("Page.enable", {})
         driver.execute_cdp_cmd(
@@ -255,12 +280,19 @@ def create_driver(persistent_profile=True, user_data_dir=None):
     except Exception:
         pass
 
-    # set_window_size 是冗余调用 (--window-size 启动参数已经设过了)。
-    # 在某些情况下 (会话恢复对话框、profile 复用首启动较慢等) 会拿不到
-    # 主窗口而抛 "Browser window not found",这里包 try/except 让它不致命。
+    # 设置窗口尺寸:宽 1100,高度填满屏幕可用区域(竖向拉满)
     try:
-        driver.set_window_size(1100, 820)
+        screen_h = driver.execute_script("return window.screen.availHeight")
+        target_h = int(screen_h) if isinstance(screen_h, (int, float)) and screen_h > 600 else 820
+        driver.set_window_size(1100, target_h)
+        try:
+            driver.set_window_position(0, 0)
+        except Exception:
+            pass
     except Exception:
-        pass
+        try:
+            driver.set_window_size(1100, 820)
+        except Exception:
+            pass
 
     return driver
